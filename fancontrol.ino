@@ -1,6 +1,6 @@
 /**
  * Amplifier Fan Controller
- * (C) 2014 W Brodie-Tyrrell
+ * (C) 2014-2016 William Brodie-Tyrrell
  *
  * This is a PID-based fan-speed controller for use in conjunction with an audio power
  * amplifier or similar linear device.  It has two temp-control modes:
@@ -13,7 +13,7 @@
  * temperature set-point will be brought down and the fan will run harder to keep the system
  * cooler while operating at a higher power level.  The purpose is to match the thermal conditions
  * to the load:
- *  - at low power, high temp is acceptable but fan noise is not,
+ *  - at low power, higher temp is acceptable but fan noise is not,
  *  - at high power, the fan is inaudible and lower temp is desirable to maximise transistor SOA.
  *
  * There are two nested PID loops:
@@ -25,88 +25,97 @@
  * Amplifier power is applied only when:
  *  - the remote-trigger signal is asserted,
  *  - the fan has not stalled, 
- *  - the AVR is successfully getting temp readings from both sensors, and
- *  - the heatsink temperature is below the safety-cutoff level
- *       (hard backup: relay must be wired to switch off if a TH signal is asserted)
- *
- * An LCD can be connected, which will display thermal & controller status.
+ *  - the AVR is successfully getting temp readings from all sensors, and
+ *  - all measured temperatures are below the safety-cutoff level
+ *      - hard backup: temp sensors have an "overtemp" signal that will cut power even
+ *        in the case of software failure.
  *
  * There are the following modes, treated as a finite state machine:
- * - init (full fan power at startup, lasts 1s)
- * - off (remote off)
+ * - off (remote signal is off)
+ * - init (full fan power at startup to overcome stiction; lasts 1s)
  * - cooldown (remote off, but temp still high)
  * - delay (remote has turned on, we are waiting before turning on the power)
- * - mute (amp turned on but held in mute while stabilising)
+ * - mute (amp turned on but held in mute while its power supply stabilises)
  * - run (normal operation)
  * - failed (overheat or fan dead)
  *
- * Future work:
- *  - muting for turn-on/off thump prevention
- *  - AC detection
- *  - fan power-down, independent of relay
- *  - integrate volume-control chips and IR remote-receiver
- *  - serial link between multiple amps to synchronise volume levels
+ * When entering failure-mode, the fault-LED will flash a few times:
+ * 1: overheat
+ * 2: fan stall
+ * 3: sensor failure
  *
- * Intended target device is an Arduino Nano, for installation in the amplifier.
+ * Future work and missing features
+ *  - AC detection
+ *  - low-temp fan power-down, independent of relay
+ *  - IR remote receiver
+ *  - put control-parameters in EEPROM and permit changes over serial
+ *
+ * Intended target is an Arduino Nano v3, with custom carrier/shield board.
  */
 
-#include <PID_v1.h>
-#include <LiquidCrystal.h>
-#include <DS1620.h>
 #include <avr/interrupt.h>
 #include <avr/io.h>
 #include <Arduino.h>
+#include <Wire.h>
+#include <PID_v1.h>
+#include <DS1621.h>
 
-#define DS_DQ 2
-#define DS_CLK 3
-#define DS_RSTA 5
-#define DS_RSTB 6
+#define DS_SDA A4   ///< fixed pins defined by I2C hardware
+#define DS_SCL A5
 
-#define FAULT  13    // indicator LED
-#define RELAY A4       // power relay to run amplifiers
-#define FAN  11      // timer2 HF PWM output  (FIXED PIN)
-#define FANPWR 4     // fan power-up
-#define REMOTE 12    // remote-powerup input
-#define SPEED 8      // ICP1=PB0=8, tacho input (FIXED PIN)
-#define MUTE 7       // mute signal for de-thump
-#define ACPRESENT 10  // AC detection
+#define FAULT  13     ///< indicator LED
+#define RELAY 5       ///< power relay to run amplifiers
+#define FAN  11       ///< timer2 HF PWM output  (FIXED PIN)
+#define FANPWR 10     ///< fan power-up
+#define REMOTE 3      ///< remote-powerup input
+#define SPEED 8       ///< ICP1=PB0=8, tacho input (FIXED PIN)
+#define MUTE 6        ///< mute signal for de-thump
+#define IR 2          ///< infrared-remote
 
-#define LCDD7  A0    // status display, 16x2 HD44780
-#define LCDD6  A1
-#define LCDD5  A2
-#define LCDD4  A3
-#define LCDRS  DS_CLK
-#define LCDEN  A5
+#define SENSOR_MASK 0x03   ///< 8-bit mask of which DS1621 addresses have devices on them
+                           // for example if 0, 1 and 7 are present, it is 0x83
 
-#define DS_CONF (DS1620::CBIT | DS1620::CPU)
-#define DS_MASK 0x0F
+/// configuration bits for sensors.  Active-high, not 1-shot.
+#define SENSOR_CFG DS1621::CFG_POL
 
-// temp-measurement devices
-DS1620 ds1620a(DS_DQ, DS_CLK, DS_RSTA);
-DS1620 ds1620b(DS_DQ, DS_CLK, DS_RSTB);
+// LED flash-codes for failures
+#define CODE_OVERHEAT 1
+#define CODE_FANSTALL 2
+#define CODE_SENSOR   3
 
-// LCD display
-LiquidCrystal lcd(LCDRS, LCDEN, LCDD4, LCDD5, LCDD6, LCDD7);
+/// temp-sensor objects.
+DS1621 sensor[8]={
+  DS1621(0), DS1621(1), DS1621(2), DS1621(3),
+  DS1621(4), DS1621(5), DS1621(6), DS1621(7)
+};
 
 // control presets
-const double over_temp=60.0;       // cooking, turn it all off.
-const double high_temp=45.0;       // high-temp/low-speed preset
-const double low_temp=40.0;        // low-temp/high-speed preset
-const double threshold_up=1500;    // if fan faster than this, lower the preset
-const double threshold_down=1200;   // if fan slower than this, raise the preset
-const double rpm_min=450, rpm_max=2000;  // fan capabilities
-const long threshold_time=60000;   // speed must cross threshold for 1 minute
-const long init_delay=1000;        // fan test-spinup time at boot
-const long on_delay=200;           // wait this long after remote asserted before powering up
-const long mute_delay=200;         // wait this long before coming out of mute
+const double over_temp=60.0;       ///< cooking, turn it all off.
+const double high_temp=50.0;       ///< high-temp/low-speed preset
+const double low_temp=40.0;        ///< low-temp/high-speed preset
+const short hw_shutdown=DS1621::tempFromDegC(over_temp);   ///< hardware power-down on software failure
+const short hw_recover=DS1621::tempFromDegC(high_temp);    ///< point at which hardware power-down releases
+const double threshold_up=1500;    ///< if fan faster than this, lower the preset
+const double threshold_down=1200;  ///< if fan slower than this, raise the preset
+const double rpm_min=450, rpm_max=2000;  ///< fan capabilities/behaviour
+const double rpm_stall=0.5*rpm_min;
+const long threshold_time=60000;   ///< speed must cross threshold for 1 minute to change temp preset
+const long init_delay=1000;        ///< fan test-spinup time at boot
+const long on_delay=500;           ///< wait this long after remote asserted for fan to spin-up before applying amp power
+const long mute_delay=200;         ///< wait this long before coming out of mute
 
 // timer speed that we clock the tacho with
 const float timer_rpm=7.5e6;
 // PID sample periods
 const int Ts_rpm=200, Ts_temp=4000;
 // PID state-variables 
-double fanrpm, fanpwm=255, rpmSetpoint=rpm_max;
+double fanrpm=0.0, fanpwm=255.0, rpmSetpoint=rpm_max;
 double temperature=25.0, tempSetpoint=high_temp;
+
+/// sensor-failure
+bool failflag=false;
+/// fan SHOULD be running, so can fail if this is set but it's stalled
+bool checkfan=false;
 
 /// inner control loop
 PID rpmpid(&fanrpm, &fanpwm, &rpmSetpoint, 0.02, 0.05, 0, DIRECT);
@@ -194,6 +203,9 @@ const short maxAccum=1;
 // not used in interrupt code
 long prevPeriodPtr=-1;
 
+// for debug and status messages
+char printbuf[64];
+
 /// setup timer1 to count fan pulses
 void speedSetup()
 { 
@@ -233,57 +245,6 @@ ISR(TIMER1_CAPT_vect)
   accumPeriod=0;  
 }
 
-/// setup Timer2 as high-speed (32kHz) PWM
-void pwmSetup()
-{
-  OCR2A=0xFF;    // max output
-  TCCR2A=0x81;   // phase-correct PWM, non-inverted
-  TCCR2B=0x01;   // no prescale, 32kHz output
-}
-
-/// main entry-point: configure the system
-void setup()
-{
-  lcd.begin(8, 2);
-  lcd.clear();
-
-  // boot & configure the temp sensors
-  if((ds1620a.getConfig() & DS_MASK) != DS_CONF)
-    ds1620a.setConfig(DS_CONF);
-  ds1620a.convert();
-  if((ds1620b.getConfig() & DS_MASK) != DS_CONF)
-    ds1620b.setConfig(DS_CONF);
-  ds1620b.convert();
-
-  // configure PIDs
-  rpmpid.SetSampleTime(Ts_rpm);
-  rpmpid.SetOutputLimits(0, 255);  // PWM bounds
-  rpmpid.SetMode(AUTOMATIC);
-
-  temppid.SetSampleTime(Ts_temp);
-  temppid.SetOutputLimits(rpm_min, rpm_max);  // fan speed range
-  temppid.SetMode(AUTOMATIC);
-  tempSetpoint=high_temp;  
-
-  // setup RPM measurement
-  speedSetup();
-
-  // setup fan PWM and other IO
-  pinMode(FAN, OUTPUT);
-  pinMode(FANPWR, OUTPUT);
-  pinMode(RELAY, OUTPUT);
-  pinMode(FAULT, OUTPUT);
-  pinMode(REMOTE, INPUT);
-  pinMode(MUTE, OUTPUT);
-  pinMode(ACPRESENT, INPUT);
-  pwmSetup();
-
-  digitalWrite(FAULT, 0);
-
-  // we startup and wait for the fan to get going
-  changeMode(MODE_INIT);
-}
-
 const float outlierExclude=2.0;
 
 /// return mean value excluding outliers
@@ -319,10 +280,172 @@ float filterPeriod(long *window, char *count, char startat, char maxsamp)
   return mean/count[0];
 }
 
-/// polling loop at about 5Hz
+
+/// setup Timer2 as high-speed (32kHz) PWM
+void pwmSetup()
+{
+  OCR2A=0xFF;    // max output
+  TCCR2A=0x81;   // phase-correct PWM, non-inverted
+  TCCR2B=0x01;   // no prescale, 32kHz output
+}
+
+/// setup all the expected temperature sensors
+void tempSetup()
+{
+  Wire.begin();
+
+  sprintf(printbuf, "TH/TL: %04X %04X\n", hw_shutdown, hw_recover);
+  Serial.print(printbuf);
+
+  // pre-configure all sensors that we expect to be present
+  for(int i=0;i<8;++i){
+    if((SENSOR_MASK & (1<<i)) != 0){
+      sensor[i].setConfig(SENSOR_CFG);
+      sensor[i].convert();
+      sensor[i].setTH(hw_shutdown);
+      sensor[i].setTL(hw_recover);
+    }
+  }
+}
+
+/// monitor all the temperature sensors
+void tempMeasure()
+{
+  short maxtmp=DS1621::INVALID_TEMP;
+  failflag=false;
+
+  // inspect all expected sensors
+  for(int i=0;i<8;++i){
+    if((SENSOR_MASK & (1<<i)) != 0){
+
+      Serial.print("[");
+      Serial.print(i);
+      Serial.print("] ");
+
+      // check that sensor is present and reporting correct configuration
+      if((sensor[i].getConfig() & DS1621::CFG_CFG) != SENSOR_CFG ||
+          sensor[i].getTL() != hw_recover || 
+          sensor[i].getTH() != hw_shutdown){
+        sprintf(printbuf, "%02X %02X %02X\n", sensor[i].getConfig(), sensor[i].getTL(), sensor[i].getTH());
+        Serial.print(printbuf);
+        Serial.print("not present or misconfigured\n");
+        failflag=true;
+        continue;
+      }
+      
+      short tmp=sensor[i].getTemp();
+
+      // sensor unreachable -> FAIL!
+      if(tmp == DS1621::INVALID_TEMP){
+        Serial.print(" FAILED\n");
+        failflag=true;
+        continue;
+      }
+
+      Serial.print(" = ");
+      Serial.print(DS1621::tempToDegC(tmp));
+      Serial.print("\n");
+      // kick it along, even if it forgot it's not meant to be 1-shot.
+      sensor[i].convert();
+
+      // use the highest reading
+      if(tmp > maxtmp){
+        maxtmp=tmp;
+      }
+    }
+  }
+
+  // convert to floating-point for PID input.
+  temperature=DS1621::tempToDegC(maxtmp);
+}
+
+/// main entry-point: configure the system
+void setup()
+{  
+  // boot & configure the temp sensors
+  Serial.begin(9600);
+  tempSetup();
+
+  // setup RPM measurement
+  speedSetup();
+
+  // configure PIDs
+  rpmpid.SetSampleTime(Ts_rpm);
+  rpmpid.SetOutputLimits(0, 255);  // PWM bounds
+  rpmpid.SetMode(AUTOMATIC);
+
+  temppid.SetSampleTime(Ts_temp);
+  temppid.SetOutputLimits(rpm_min, rpm_max);  // fan speed range
+  temppid.SetMode(AUTOMATIC);
+  tempSetpoint=high_temp;  
+
+  // setup other IO to a nice default state
+  digitalWrite(FANPWR, 0);
+  digitalWrite(FAN, 0);
+  digitalWrite(RELAY, 0);
+  digitalWrite(MUTE, 1);
+  digitalWrite(FAULT, 0);
+  pinMode(FAN, OUTPUT);
+  pinMode(FANPWR, OUTPUT);
+  pinMode(RELAY, OUTPUT);
+  pinMode(FAULT, OUTPUT);
+  pinMode(MUTE, OUTPUT);
+  pinMode(REMOTE, INPUT);
+  pinMode(IR, INPUT);
+  pwmSetup();
+
+  // we startup and wait for the fan to get going
+  changeMode(MODE_INIT);
+}
+
+/// enter failure-mode and display N flashes on the fault LED.
+void indicateFailure(unsigned count)
+{
+  changeMode(MODE_FAILED);
+
+  for(unsigned i=0;i<count;++i){
+    digitalWrite(FAULT, 1);
+    delay(500);
+    digitalWrite(FAULT, 0);
+    delay(500);
+  }
+  delay(500);
+  digitalWrite(FAULT, 1);
+}
+
+/// check various bits of state and maybe go into failure mode
+/// @return true on entering failure-mode
+bool checkFailure()
+{
+  // already failed.  Can't fail again!
+  if(currentMode == MODE_FAILED){
+    return false;
+  }
+  
+  if(failflag){
+    indicateFailure(CODE_SENSOR);
+    return true;
+  }
+  else if(checkfan && fanrpm < rpm_stall){
+    indicateFailure(CODE_FANSTALL);
+    return true;
+  }
+  else if(temperature >= over_temp){
+    indicateFailure(CODE_OVERHEAT);
+    return true;
+  }
+
+  return false;
+}
+
+
+/// polling loop, variable rate but mostly 5Hz for the RPM PID loop
 void loop()
 {
   unsigned long now=millis();
+
+  // poll-blink.
+  digitalWrite(FAULT, currentMode != MODE_OFF);
 
   if(now - measurementTime > Ts_rpm){
     long window[periodWindowLength];
@@ -342,217 +465,203 @@ void loop()
     float meanPeriod=filterPeriod(&window[0], &goodCount, wPtr, min(pulseCount, periodWindowLength));
     fanrpm=(pulseCount && goodCount) ? timer_rpm/meanPeriod : 0;
 
+    // look at temp sensors
+    tempMeasure();
+
     // run control loops
     temppid.Compute();
     rpmpid.Compute();
 
-    // set the power
+    // set the fan power
     OCR2A=(int) (255-fanpwm);
-
-    temperature=max(ds1620a.getTemp(), ds1620b.getTemp())/2.0;
 
     measurementTime=now;
   }
 
-  // run the mode-specific poll function
-  (*pollfuncs[currentMode])();
+  // end blink
+  if(currentMode != MODE_FAILED){
+    digitalWrite(FAULT, currentMode == MODE_OFF);
+  }
+
+  // look for (new) major issues
+  if(!checkFailure()){
+    
+    // run the mode-specific poll function
+    (*pollfuncs[currentMode])();
+  }
 
   delay(nextPoll);
 }
 
-// display RPM and temperature on the LCD
-void printRpmTemp()
-{
-    lcd.clear();
-    lcd.print((int) fanrpm);
-    lcd.setCursor(5, 0);
-    lcd.print("RPM");
-    lcd.setCursor(1, 1);
-    lcd.print(temperature);
-    lcd.print("C");  
-}
-
+/// step the state-machine.
 void changeMode(int mode)
 {
   if(mode >= 0 && mode < MODE_COUNT){ 
     modeChangeTime=millis();
     (*enterfuncs[mode])();
     currentMode=mode;
-  }
+  }  
 }
 
+/// initialisation mode, fan on full-power to check that it works
 void enter_init()
 {
   digitalWrite(MUTE, 1);
   digitalWrite(RELAY, 0);
   digitalWrite(FANPWR, 1);
+  checkfan=false;     // only just starting up
   fanpwm=255;
   OCR2A=(int) (255-fanpwm);
 
   nextPoll=Ts_rpm;
-  
-  lcd.clear();
-  lcd.print("Fan Test");
 }
 
+/// end of init-mode, make sure fan is running and everything is good.
 void poll_init()
 {
-  // make sure fan successfully spun up and we're not overheated
-  if(millis() - modeChangeTime > init_delay){
-    if(fanrpm == 0 || temperature >= over_temp)
-      changeMode(MODE_FAILED);
-    else
-      changeMode(MODE_OFF);
+  unsigned long dt=millis() - modeChangeTime;
+
+  // should have spun-up by now, so enable RPM-checking.
+  if(dt > init_delay - 2*nextPoll){
+    checkfan=true;
+  }
+  
+  // move to off-state
+  if(dt > init_delay){
+    changeMode(MODE_OFF);
   }
 }
 
+/// enter the off-state; mute, power-down, no fan.
 void enter_off()
 {
   digitalWrite(RELAY, 0);
   digitalWrite(MUTE, 1);
   digitalWrite(FANPWR, 0);
-
-  lcd.clear();
-  lcd.print("Off");
-  nextPoll=20;  
+  checkfan=false;
+  nextPoll=20;
 }
 
+/// in off-state, check to ask if there's a remote-signal for on
 void poll_off()
 {
   // turn back on?
-  if(digitalRead(REMOTE))
+  if(!digitalRead(REMOTE))
     changeMode(MODE_DELAY);
-
-/*    
-  lcd.clear);
-  lcd.print(ds1620a.getTemp(), 16);
-  lcd.print(ds1620b.getTemp(), 16);
-    
-  lcd.setCursor(0, 1);
-  lcd.print(ds1620a.getConfig(), 16);
-  lcd.print(" ");
-  lcd.print(ds1620b.getConfig(), 16);
-*/
-  ds1620a.convert();
-  ds1620b.convert();
 }
 
+/// enter cooldown: mute, power-down, fan still on
 void enter_cooldown()
 {
   digitalWrite(RELAY, 0);
   digitalWrite(MUTE, 1);
   digitalWrite(FANPWR, 1);
-
-  lcd.clear();
-  lcd.print("Cooldown");
-  nextPoll=Ts_rpm;
-}
-
-void poll_cooldown()
-{
+  checkfan=true;
+  
   // don't work too hard...
   tempSetpoint=high_temp;
 
+  nextPoll=Ts_rpm;
+}
+
+/// check in cooldown, look for low-temp or remote-signal for on
+void poll_cooldown()
+{
   // power is back!
-  if(digitalRead(REMOTE))
+  if(!digitalRead(REMOTE)){
     changeMode(MODE_DELAY);
+  }
   // wait until cool
-  else if(temperature < high_temp)
+  else if(temperature < high_temp){
     changeMode(MODE_OFF);    
-  // check for stall
-  else if(fanrpm == 0 || temperature >= over_temp)
-    changeMode(MODE_FAILED);
-  else{
-    lcd.clear();
-    lcd.print("Cooldown");
-    lcd.setCursor(1, 1);
-    lcd.print(temperature);
-    lcd.print("C"); 
   }
 }
 
+/// delay mode: bring up the fan and mute, but no power yet.
+/// setting different delays on each amp gives power sequencing
 void enter_delay()
 {
   digitalWrite(RELAY, 0);
   digitalWrite(MUTE, 1);
   digitalWrite(FANPWR, 1);
+  checkfan=false;
   // come up in slow mode
   tempSetpoint=high_temp;
   nextPoll=Ts_rpm;
-  
-  lcd.clear();
-  lcd.write("Power!");
 }
 
+/// check at end of delay: power-up or fail
 void poll_delay()
 {
-  // after finite time, we power-up unless overheated
-  if(millis() - modeChangeTime > on_delay){
-    if(temperature < over_temp)
-      changeMode(MODE_MUTE);
-    else
-      changeMode(MODE_FAILED);
+  if(digitalRead(REMOTE)){
+    // user changes mind / glitch on REMOTE line.
+    changeMode(MODE_COOLDOWN);
+    return;
   }
   
-  lcd.setCursor(0, 1);
-  lcd.print("cnf ");
-  lcd.print(ds1620a.getConfig(), 16);
+  // after finite time, we power-up unless overheated
+  if(millis() - modeChangeTime > on_delay){
+    changeMode(MODE_MUTE);
+  }
 }
 
+/// mute-mode: amplifier and fan on, still in mute for a bit.
 void enter_mute()
 {
   digitalWrite(RELAY, 1);
   digitalWrite(MUTE, 1);
   digitalWrite(FANPWR, 1);
+  checkfan=true;    // fan should be going by now (spun up during MODE_DELAY)
   nextPoll=Ts_rpm;  
-  
-  lcd.clear();
-  lcd.print("Mute");
 }
 
+/// wait for end of mute-time, check that fan is running
 void poll_mute()
 {
   // after finite time, we come out of mute
-  if(millis() - modeChangeTime > mute_delay)
-    changeMode(MODE_RUN);
-
-  lcd.clear();
-  lcd.print(ds1620b.getConfig(), 16);
-
-  lcd.setCursor(0, 1);
-  lcd.print("tmp ");
-  lcd.print((short) ds1620b.getTemp(), 16);
+  if(millis() - modeChangeTime > mute_delay){    
+    if(digitalRead(REMOTE)){
+      // user changed mind, turning off
+      changeMode(MODE_COOLDOWN);
+    }
+    else{
+      // go!
+      changeMode(MODE_RUN);
+    }
+  }
 }
 
+/// begin run-mode: this is the primary, everything-on, do-stuff mode.
 void enter_run()
 {
   digitalWrite(RELAY, 1);
   digitalWrite(MUTE, 0);
   digitalWrite(FANPWR, 1);
+  checkfan=true;
   tempSetpoint=high_temp; 
   nextPoll=Ts_rpm;
 }
 
+/// inside the run-mode; look for conditions that require a mode-change.
 void poll_run()
 {
-  // fan failed or overheated
-  if(fanrpm == 0 || temperature >= over_temp)
-    changeMode(MODE_FAILED);
   // remote says stop
-  else if(!digitalRead(REMOTE))
+  if(digitalRead(REMOTE)){
     changeMode(MODE_COOLDOWN);
-  // amp under load, speed up
-  else{
-    if(tempSetpoint == high_temp && fanrpm > threshold_up)
-      tempSetpoint = low_temp;    
+    return;
+  }
+
+  if(tempSetpoint == high_temp && fanrpm > threshold_up){
+    /// amp under load, speed up the fan
+    tempSetpoint = low_temp;    
+  }    
+  else if(tempSetpoint == low_temp && fanrpm < threshold_down){
     // amp unloaded and cooled, slow down
-    else if(tempSetpoint == low_temp && fanrpm > threshold_down)
-      tempSetpoint = high_temp;
-      
-    printRpmTemp();
+    tempSetpoint = high_temp;
   }
 }
 
+/// failure: terminal mode where we shut power off and leave the fan on until cool or siezed
 void enter_failed()
 {
   // shut it down
@@ -561,29 +670,24 @@ void enter_failed()
   digitalWrite(FANPWR, 1);
   digitalWrite(FAULT, 1);
  
-  lcd.clear();
-  if(fanrpm == 0)
-    lcd.print("Fan Fail");
-  else if(temperature >= over_temp){
-    lcd.print("Overheat");
-    lcd.setCursor(1, 1);
-    lcd.print(temperature);
-    lcd.print("C");
-  }
-  else
-    lcd.print("Failure");
- 
   // run fan flat out, ignore temperature
   temppid.SetMode(MANUAL);
   rpmSetpoint=rpm_max;
+  OCR2A=(int) 0;
   
   nextPoll=Ts_rpm;
 }
 
+/// checks in fail-mode: turn fan off once cool.
 void poll_failed()
 {
-  // turn fan off once cooled or if stalled
-  if(temperature < high_temp || fanrpm == 0){
+  // transition to OFF mode once cooled, sensors OK and remote de-asserted.
+  if(temperature < high_temp && !failflag && digitalRead(REMOTE)){
+    changeMode(MODE_OFF);
+    return;
+  }
+
+  if(temperature < high_temp || fanrpm < rpm_stall){
     digitalWrite(FANPWR, 0);
     nextPoll=1000;
   }
