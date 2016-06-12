@@ -72,7 +72,7 @@
 #define MUTE 6        ///< mute signal for de-thump
 #define IR 2          ///< infrared-remote
 
-#define SENSOR_MASK 0x03   ///< 8-bit mask of which DS1621 addresses have devices on them
+#define SENSOR_MASK 0x01   ///< 8-bit mask of which DS1621 addresses have devices on them
                            // for example if 0, 1 and 7 are present, it is 0x83
 
 /// configuration bits for sensors.  Active-high, not 1-shot.
@@ -90,13 +90,13 @@ DS1621 sensor[8]={
 };
 
 // control presets
-const double over_temp=60.0;       ///< cooking, turn it all off.
+const double over_temp=70.0;       ///< cooking, turn it all off.
 const double high_temp=50.0;       ///< high-temp/low-speed preset
 const double low_temp=40.0;        ///< low-temp/high-speed preset
 const short hw_shutdown=DS1621::tempFromDegC(over_temp);   ///< hardware power-down on software failure
 const short hw_recover=DS1621::tempFromDegC(high_temp);    ///< point at which hardware power-down releases
-const double threshold_up=1500;    ///< if fan faster than this, lower the preset
-const double threshold_down=1200;  ///< if fan slower than this, raise the preset
+const double threshold_up=1800;    ///< if fan faster than this, lower the preset
+const double threshold_down=1000;  ///< if fan slower than this, raise the preset
 const double rpm_min=450, rpm_max=2000;  ///< fan capabilities/behaviour
 const double rpm_stall=0.5*rpm_min;
 const long threshold_time=60000;   ///< speed must cross threshold for 1 minute to change temp preset
@@ -116,6 +116,8 @@ double temperature=25.0, tempSetpoint=high_temp;
 bool failflag=false;
 /// fan SHOULD be running, so can fail if this is set but it's stalled
 bool checkfan=false;
+/// what kind of failure
+int failmode=0;
 
 /// inner control loop
 PID rpmpid(&fanrpm, &fanpwm, &rpmSetpoint, 0.02, 0.05, 0, DIRECT);
@@ -399,18 +401,23 @@ void setup()
 }
 
 /// enter failure-mode and display N flashes on the fault LED.
-void indicateFailure(unsigned count)
+void setFailureMode(unsigned count)
 {
+  failmode=count;
   changeMode(MODE_FAILED);
+}
 
-  for(unsigned i=0;i<count;++i){
+/// show a blink-code indicating what has failed.
+void indicateFailure()
+{
+  for(unsigned i=0;i<failmode;++i){
     digitalWrite(FAULT, 1);
     delay(500);
     digitalWrite(FAULT, 0);
     delay(500);
   }
-  delay(500);
-  digitalWrite(FAULT, 1);
+  delay(1000);
+  // digitalWrite(FAULT, 1);
 }
 
 /// check various bits of state and maybe go into failure mode
@@ -423,15 +430,15 @@ bool checkFailure()
   }
   
   if(failflag){
-    indicateFailure(CODE_SENSOR);
+    setFailureMode(CODE_SENSOR);
     return true;
   }
   else if(checkfan && fanrpm < rpm_stall){
-    indicateFailure(CODE_FANSTALL);
+    setFailureMode(CODE_FANSTALL);
     return true;
   }
   else if(temperature >= over_temp){
-    indicateFailure(CODE_OVERHEAT);
+    setFailureMode(CODE_OVERHEAT);
     return true;
   }
 
@@ -445,7 +452,9 @@ void loop()
   unsigned long now=millis();
 
   // poll-blink.
-  digitalWrite(FAULT, currentMode != MODE_OFF);
+  if(currentMode != MODE_FAILED){
+    digitalWrite(FAULT, currentMode != MODE_OFF);
+  }
 
   if(now - measurementTime > Ts_rpm){
     long window[periodWindowLength];
@@ -484,11 +493,10 @@ void loop()
   }
 
   // look for (new) major issues
-  if(!checkFailure()){
+  checkFailure();
     
-    // run the mode-specific poll function
-    (*pollfuncs[currentMode])();
-  }
+  // run the mode-specific poll function
+  (*pollfuncs[currentMode])();
 
   delay(nextPoll);
 }
@@ -668,28 +676,29 @@ void enter_failed()
   digitalWrite(RELAY, 0);
   digitalWrite(MUTE, 1);
   digitalWrite(FANPWR, 1);
-  digitalWrite(FAULT, 1);
  
   // run fan flat out, ignore temperature
   temppid.SetMode(MANUAL);
   rpmSetpoint=rpm_max;
   OCR2A=(int) 0;
   
-  nextPoll=Ts_rpm;
+  nextPoll=2000;
 }
 
 /// checks in fail-mode: turn fan off once cool.
 void poll_failed()
-{
+{ 
   // transition to OFF mode once cooled, sensors OK and remote de-asserted.
   if(temperature < high_temp && !failflag && digitalRead(REMOTE)){
     changeMode(MODE_OFF);
     return;
   }
 
+  indicateFailure();
+
+  // turn fan off if stalled or cool
   if(temperature < high_temp || fanrpm < rpm_stall){
     digitalWrite(FANPWR, 0);
-    nextPoll=1000;
   }
 }
 
